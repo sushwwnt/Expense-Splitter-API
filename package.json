@@ -2,30 +2,27 @@
   "name": "expense-splitter",
   "version": "1.0.0",
   "description": "",
-  "main": "src/index.ts",
+  "main": "server.ts",
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
-    "db:test": "tsx src/db-test.ts",
-    "db:setup": "tsx src/db-setup.ts"
+    "dev": "tsx watch src/server.ts"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "cors": "^2.8.6",
     "dotenv": "^18.0.6",
     "express": "^5.2.1",
     "pg": "^8.23.1",
     "zod": "^4.6.5"
   },
   "devDependencies": {
+    "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/node": "^26.6.4",
     "@types/pg": "^8.23.1",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"
-  },
-  "allowScripts": {
-    "esbuild@0.28.2": true
   }
 }

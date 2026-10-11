@@ -1,26 +1,44 @@
-import express, { Request, Response } from 'express';
+import express from 'express';
+import type { Request, Response } from 'express';
 import 'dotenv/config';
 import { pool } from './db/db.js';
 import { z } from 'zod';
 import cors from 'cors';
+import { computeShares, validatePayers, toPaise, toRupees } from './splits.js';
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+
+// Money is stored in the database as integer paise (100 paise = 1 rupee).
+// The API talks in rupees, so we convert at the edges.
+
 // Test route
 app.get('/', (req, res) => {
   res.json({ message: 'Expense Splitter API is running smoothly #sobercodes !' });
 });
 
-// Zod schema for validation
+// ---------------------------------------------------------------------------
+// Users
+// ---------------------------------------------------------------------------
+
 const createUserSchema = z.object({
   name: z.string().min(1, 'Name is required'),
   email: z.string().email('Invalid email format'),
 });
 
-// 1. Create User API
+app.get('/users', async (req: Request, res: Response) => {
+  try {
+    const result = await pool.query('SELECT id, name, email, created_at FROM users ORDER BY id;');
+    return res.status(200).json(result.rows);
+  } catch (error: any) {
+    console.error('Error fetching users:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.post('/users', async (req: Request, res: Response) => {
   try {
     const validationResult = createUserSchema.safeParse(req.body);
@@ -35,7 +53,7 @@ app.post('/users', async (req: Request, res: Response) => {
       VALUES ($1, $2) 
       RETURNING id, name, email, created_at;
     `;
-    
+
     const result = await pool.query(queryText, [name, email]);
 
     return res.status(201).json({
@@ -51,53 +69,112 @@ app.post('/users', async (req: Request, res: Response) => {
   }
 });
 
-// Zod schema for group creation
+// ---------------------------------------------------------------------------
+// Groups
+// ---------------------------------------------------------------------------
+
 const createGroupSchema = z.object({
   name: z.string().min(1, 'Group name is required'),
   description: z.string().optional(),
   created_by: z.number().int().positive('Valid creator user ID is required'),
+  member_ids: z.array(z.number().int().positive()).optional(),
 });
 
+app.get('/groups', async (req: Request, res: Response) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, name, description, created_by, created_at FROM groups ORDER BY id;'
+    );
+    return res.status(200).json(result.rows);
+  } catch (error: any) {
+    console.error('Error fetching groups:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create a group with its first members. The creator is always a member.
 app.post('/groups', async (req: Request, res: Response) => {
+  const client = await pool.connect();
   try {
     const validationResult = createGroupSchema.safeParse(req.body);
     if (!validationResult.success) {
       return res.status(400).json({ error: validationResult.error.format() });
     }
 
-    const { name, description, created_by } = validationResult.data;
+    const { name, description, created_by, member_ids } = validationResult.data;
 
-    const userCheck = await pool.query('SELECT id FROM users WHERE id = $1', [created_by]);
-    if (userCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'Creator user not found' });
+    const memberIds = Array.from(new Set([created_by, ...(member_ids ?? [])]));
+
+    const usersCheck = await client.query('SELECT id FROM users WHERE id = ANY($1::int[])', [memberIds]);
+    if (usersCheck.rows.length !== memberIds.length) {
+      return res.status(404).json({ error: 'One or more selected people were not found' });
     }
+
+    // Group and all its members are saved together or not at all
+    await client.query('BEGIN');
 
     const groupQuery = `
       INSERT INTO groups (name, description, created_by) 
       VALUES ($1, $2, $3) 
       RETURNING id, name, description, created_by, created_at;
     `;
-    const groupResult = await pool.query(groupQuery, [name, description || null, created_by]);
+    const groupResult = await client.query(groupQuery, [name, description || null, created_by]);
     const newGroup = groupResult.rows[0];
 
-    await pool.query(
-      'INSERT INTO group_members (group_id, user_id) VALUES ($1, $2)',
-      [newGroup.id, created_by]
+    await client.query(
+      'INSERT INTO group_members (group_id, user_id) SELECT $1::int, UNNEST($2::int[])',
+      [newGroup.id, memberIds]
     );
+
+    await client.query('COMMIT');
 
     return res.status(201).json({
       message: 'Group created successfully',
       group: newGroup,
     });
   } catch (error: any) {
+    await client.query('ROLLBACK');
     console.error('Error creating group:', error);
     return res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
   }
 });
 
-// Zod schema for adding a member
+// ---------------------------------------------------------------------------
+// Group members
+// ---------------------------------------------------------------------------
+
 const addMemberSchema = z.object({
   user_id: z.number().int().positive('Valid user ID is required'),
+});
+
+app.get('/groups/:groupId/members', async (req: Request, res: Response) => {
+  try {
+    const groupId = Number(req.params.groupId);
+    if (isNaN(groupId)) {
+      return res.status(400).json({ error: 'Invalid group ID format' });
+    }
+
+    const groupCheck = await pool.query('SELECT id FROM groups WHERE id = $1', [groupId]);
+    if (groupCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+
+    const result = await pool.query(
+      `SELECT u.id, u.name, u.email, gm.joined_at
+       FROM group_members gm
+       JOIN users u ON u.id = gm.user_id
+       WHERE gm.group_id = $1
+       ORDER BY u.name;`,
+      [groupId]
+    );
+
+    return res.status(200).json(result.rows);
+  } catch (error: any) {
+    console.error('Error fetching members:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 app.post('/groups/:groupId/members', async (req: Request, res: Response) => {
@@ -124,13 +201,12 @@ app.post('/groups/:groupId/members', async (req: Request, res: Response) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    const query = `
-      INSERT INTO group_members (group_id, user_id) 
-      VALUES ($1, $2) 
-      RETURNING group_id, user_id, joined_at;
-    `;
-    
-    const result = await pool.query(query, [groupId, user_id]);
+    const result = await pool.query(
+      `INSERT INTO group_members (group_id, user_id) 
+       VALUES ($1, $2) 
+       RETURNING group_id, user_id, joined_at;`,
+      [groupId, user_id]
+    );
 
     return res.status(201).json({
       message: 'Member added to group successfully',
@@ -145,17 +221,73 @@ app.post('/groups/:groupId/members', async (req: Request, res: Response) => {
   }
 });
 
-// Zod schema for expense creation
+// Remove a member. Blocked if they already appear in an expense or settlement,
+// because removing them would break the balances of everyone else.
+app.delete('/groups/:groupId/members/:userId', async (req: Request, res: Response) => {
+  try {
+    const groupId = Number(req.params.groupId);
+    const userId = Number(req.params.userId);
+    if (isNaN(groupId) || isNaN(userId)) {
+      return res.status(400).json({ error: 'Invalid ID format' });
+    }
+
+    const usage = await pool.query(
+      `SELECT 1 FROM expense_payers p JOIN expenses e ON e.id = p.expense_id
+         WHERE e.group_id = $1 AND p.user_id = $2
+       UNION ALL
+       SELECT 1 FROM expense_splits s JOIN expenses e ON e.id = s.expense_id
+         WHERE e.group_id = $1 AND s.user_id = $2
+       UNION ALL
+       SELECT 1 FROM settlements
+         WHERE group_id = $1 AND (from_user = $2 OR to_user = $2)
+       LIMIT 1;`,
+      [groupId, userId]
+    );
+    if (usage.rows.length > 0) {
+      return res.status(409).json({
+        error: 'This person already has expenses in this group, so they cannot be removed',
+      });
+    }
+
+    const result = await pool.query(
+      'DELETE FROM group_members WHERE group_id = $1 AND user_id = $2 RETURNING user_id',
+      [groupId, userId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'This person is not a member of the group' });
+    }
+
+    return res.status(200).json({ message: 'Member removed from group' });
+  } catch (error: any) {
+    console.error('Error removing member:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Expenses (multiple payers, equal / exact / percentage splits)
+// ---------------------------------------------------------------------------
+
 const createExpenseSchema = z.object({
   description: z.string().min(1, 'Description is required'),
   amount: z.number().positive('Amount must be greater than zero'),
-  paid_by: z.number().int().positive('Paid by user ID is required'),
-  splits: z.array(
-    z.object({
-      user_id: z.number().int().positive(),
-      amount: z.number().positive(),
-    })
-  ).min(1, 'At least one split is required'),
+  split_type: z.enum(['EQUAL', 'EXACT', 'PERCENT']).default('EQUAL'),
+  payers: z
+    .array(
+      z.object({
+        user_id: z.number().int().positive(),
+        amount: z.number().positive(),
+      })
+    )
+    .min(1, 'At least one payer is required'),
+  splits: z
+    .array(
+      z.object({
+        user_id: z.number().int().positive(),
+        value: z.number().positive().optional(),
+      })
+    )
+    .min(1, 'At least one person is required in the split'),
 });
 
 app.post('/groups/:groupId/expenses', async (req: Request, res: Response) => {
@@ -171,37 +303,69 @@ app.post('/groups/:groupId/expenses', async (req: Request, res: Response) => {
       return res.status(400).json({ error: validationResult.error.format() });
     }
 
-    const { description, amount, paid_by, splits } = validationResult.data;
+    const { description, amount, split_type, payers, splits } = validationResult.data;
+    const totalPaise = toPaise(amount);
 
-    const totalSplitAmount = splits.reduce((sum, split) => sum + split.amount, 0);
-    if (Math.abs(totalSplitAmount - amount) > 0.01) {
-      return res.status(400).json({ error: 'Sum of split amounts must equal total expense amount' });
+    // Work out exact paise for payers and for each person in the split
+    const payerResult = validatePayers(totalPaise, payers);
+    if (!payerResult.ok) {
+      return res.status(400).json({ error: payerResult.error });
+    }
+
+    const shareResult = computeShares(split_type, totalPaise, splits);
+    if (!shareResult.ok) {
+      return res.status(400).json({ error: shareResult.error });
+    }
+
+    const payerRows = payerResult.data;
+    const shareRows = shareResult.data;
+
+    const groupCheck = await client.query('SELECT id FROM groups WHERE id = $1', [groupId]);
+    if (groupCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+
+    // Everyone involved has to be a member of this group
+    const memberResult = await client.query('SELECT user_id FROM group_members WHERE group_id = $1', [groupId]);
+    const memberSet = new Set<number>(memberResult.rows.map(row => row.user_id));
+    const outsiders = [...payerRows, ...shareRows].filter(row => !memberSet.has(row.user_id));
+    if (outsiders.length > 0) {
+      return res.status(400).json({ error: 'Everyone who paid or shares the cost must be a member of this group' });
     }
 
     await client.query('BEGIN');
 
-    const expenseQuery = `
-      INSERT INTO expenses (group_id, description, amount, paid_by)
-      VALUES ($1, $2, $3, $4)
-      RETURNING id, group_id, description, amount, paid_by, created_at;
-    `;
-    const expenseResult = await client.query(expenseQuery, [groupId, description, amount, paid_by]);
+    const expenseResult = await client.query(
+      `INSERT INTO expenses (group_id, description, amount, split_type)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, group_id, description, amount, split_type, created_at;`,
+      [groupId, description, totalPaise, split_type]
+    );
     const expense = expenseResult.rows[0];
 
-    for (const split of splits) {
-      const splitQuery = `
-        INSERT INTO expense_splits (expense_id, user_id, amount)
-        VALUES ($1, $2, $3);
-      `;
-      await client.query(splitQuery, [expense.id, split.user_id, split.amount]);
+    for (const payer of payerRows) {
+      await client.query('INSERT INTO expense_payers (expense_id, user_id, amount) VALUES ($1, $2, $3)', [
+        expense.id,
+        payer.user_id,
+        payer.amount,
+      ]);
+    }
+
+    for (const share of shareRows) {
+      await client.query('INSERT INTO expense_splits (expense_id, user_id, amount) VALUES ($1, $2, $3)', [
+        expense.id,
+        share.user_id,
+        share.amount,
+      ]);
     }
 
     await client.query('COMMIT');
 
     return res.status(201).json({
       message: 'Expense added and split successfully',
-      expense,
-      splits,
+      expense: { ...expense, amount: toRupees(expense.amount) },
+      payers: payerRows.map(p => ({ user_id: p.user_id, amount: toRupees(p.amount) })),
+      splits: shareRows.map(s => ({ user_id: s.user_id, amount: toRupees(s.amount) })),
     });
   } catch (error: any) {
     await client.query('ROLLBACK');
@@ -212,7 +376,6 @@ app.post('/groups/:groupId/expenses', async (req: Request, res: Response) => {
   }
 });
 
-// GET Group Expenses Endpoint
 app.get('/groups/:groupId/expenses', async (req: Request, res: Response) => {
   try {
     const groupId = Number(req.params.groupId);
@@ -226,24 +389,44 @@ app.get('/groups/:groupId/expenses', async (req: Request, res: Response) => {
     }
 
     const query = `
-      SELECT 
-        e.id, 
-        e.group_id, 
-        e.description, 
-        e.amount, 
-        e.paid_by, 
-        u.name AS paid_by_name, 
-        e.created_at
+      SELECT
+        e.id,
+        e.group_id,
+        e.description,
+        e.amount,
+        e.split_type,
+        e.created_at,
+        COALESCE((
+          SELECT json_agg(json_build_object('user_id', p.user_id, 'name', u.name, 'amount', p.amount) ORDER BY u.name)
+          FROM expense_payers p
+          JOIN users u ON u.id = p.user_id
+          WHERE p.expense_id = e.id
+        ), '[]'::json) AS payers,
+        COALESCE((
+          SELECT json_agg(json_build_object('user_id', s.user_id, 'name', u.name, 'amount', s.amount) ORDER BY u.name)
+          FROM expense_splits s
+          JOIN users u ON u.id = s.user_id
+          WHERE s.expense_id = e.id
+        ), '[]'::json) AS splits
       FROM expenses e
-      JOIN users u ON e.paid_by = u.id
       WHERE e.group_id = $1
-      ORDER BY e.created_at DESC;
+      ORDER BY e.created_at DESC, e.id DESC;
     `;
 
     const result = await pool.query(query, [groupId]);
 
+    const toRupeeLine = (line: { user_id: number; name: string; amount: number }) => ({
+      ...line,
+      amount: toRupees(line.amount),
+    });
+
     return res.status(200).json({
-      expenses: result.rows,
+      expenses: result.rows.map(row => ({
+        ...row,
+        amount: toRupees(row.amount),
+        payers: row.payers.map(toRupeeLine),
+        splits: row.splits.map(toRupeeLine),
+      })),
     });
   } catch (error: any) {
     console.error('Error fetching expenses:', error);
@@ -251,16 +434,17 @@ app.get('/groups/:groupId/expenses', async (req: Request, res: Response) => {
   }
 });
 
-// Zod schema for settlement validation matching schema.sql columns (from_user, to_user)
+// ---------------------------------------------------------------------------
+// Settlements
+// ---------------------------------------------------------------------------
+
 const createSettlementSchema = z.object({
   from_user: z.number().int().positive('From user ID is required'),
   to_user: z.number().int().positive('To user ID is required'),
   amount: z.number().positive('Settlement amount must be greater than zero'),
 });
 
-// POST Settlement API Endpoint
 app.post('/groups/:groupId/settle', async (req: Request, res: Response) => {
-  const client = await pool.connect();
   try {
     const groupId = Number(req.params.groupId);
     if (isNaN(groupId)) {
@@ -278,38 +462,41 @@ app.post('/groups/:groupId/settle', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'From user and To user cannot be the same' });
     }
 
-    await client.query('BEGIN');
-
-    const groupCheck = await client.query('SELECT id FROM groups WHERE id = $1', [groupId]);
+    const groupCheck = await pool.query('SELECT id FROM groups WHERE id = $1', [groupId]);
     if (groupCheck.rows.length === 0) {
-      await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Group not found' });
     }
 
-    const settlementQuery = `
-      INSERT INTO settlements (group_id, from_user, to_user, amount)
-      VALUES ($1, $2, $3, $4)
-      RETURNING id, group_id, from_user, to_user, amount, created_at;
-    `;
-    const result = await client.query(settlementQuery, [groupId, from_user, to_user, amount]);
-    const settlement = result.rows[0];
+    const memberCheck = await pool.query(
+      'SELECT user_id FROM group_members WHERE group_id = $1 AND user_id = ANY($2::int[])',
+      [groupId, [from_user, to_user]]
+    );
+    if (memberCheck.rows.length !== 2) {
+      return res.status(400).json({ error: 'Both people must be members of this group' });
+    }
 
-    await client.query('COMMIT');
+    const result = await pool.query(
+      `INSERT INTO settlements (group_id, from_user, to_user, amount)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, group_id, from_user, to_user, amount, created_at;`,
+      [groupId, from_user, to_user, toPaise(amount)]
+    );
+    const settlement = result.rows[0];
 
     return res.status(201).json({
       message: 'Settlement recorded successfully',
-      settlement,
+      settlement: { ...settlement, amount: toRupees(settlement.amount) },
     });
   } catch (error: any) {
-    await client.query('ROLLBACK');
     console.error('Error recording settlement:', error);
     return res.status(500).json({ error: 'Internal server error' });
-  } finally {
-    client.release();
   }
 });
 
-// GET Group Balances Endpoint (Updated with settlements mapping)
+// ---------------------------------------------------------------------------
+// Balances
+// ---------------------------------------------------------------------------
+
 app.get('/groups/:groupId/balances', async (req: Request, res: Response) => {
   try {
     const groupId = Number(req.params.groupId);
@@ -317,93 +504,94 @@ app.get('/groups/:groupId/balances', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Invalid group ID format' });
     }
 
-    // 1. Check if group exists
     const groupCheck = await pool.query('SELECT id FROM groups WHERE id = $1', [groupId]);
     if (groupCheck.rows.length === 0) {
       return res.status(404).json({ error: 'Group not found' });
     }
 
-    // 2. Get all members of the group
-    const membersQuery = `
-      SELECT u.id, u.name, u.email
-      FROM group_members gm
-      JOIN users u ON gm.user_id = u.id
-      WHERE gm.group_id = $1;
-    `;
-    const membersResult = await pool.query(membersQuery, [groupId]);
+    const membersResult = await pool.query(
+      `SELECT u.id, u.name, u.email
+       FROM group_members gm
+       JOIN users u ON gm.user_id = u.id
+       WHERE gm.group_id = $1
+       ORDER BY u.id;`,
+      [groupId]
+    );
     const members = membersResult.rows;
 
     if (members.length === 0) {
-      return res.status(200).json({ balances: [] });
+      return res.status(200).json({ group_id: groupId, balances: [] });
     }
 
-    // 3. Calculate total paid by each user in this group
-    const paidQuery = `
-      SELECT paid_by AS user_id, SUM(amount) AS total_paid
-      FROM expenses
-      WHERE group_id = $1
-      GROUP BY paid_by;
-    `;
-    const paidResult = await pool.query(paidQuery, [groupId]);
+    // Total paid by each user (an expense can have several payers)
+    const paidResult = await pool.query(
+      `SELECT p.user_id, SUM(p.amount) AS total
+       FROM expense_payers p
+       JOIN expenses e ON e.id = p.expense_id
+       WHERE e.group_id = $1
+       GROUP BY p.user_id;`,
+      [groupId]
+    );
 
-    // 4. Calculate total owed by each user from expense_splits in this group
-    const owedQuery = `
-      SELECT es.user_id, SUM(es.amount) AS total_owed
-      FROM expense_splits es
-      JOIN expenses e ON es.expense_id = e.id
-      WHERE e.group_id = $1
-      GROUP BY es.user_id;
-    `;
-    const owedResult = await pool.query(owedQuery, [groupId]);
+    // Total share each user owes across all expenses
+    const owedResult = await pool.query(
+      `SELECT es.user_id, SUM(es.amount) AS total
+       FROM expense_splits es
+       JOIN expenses e ON es.expense_id = e.id
+       WHERE e.group_id = $1
+       GROUP BY es.user_id;`,
+      [groupId]
+    );
 
-    // 5. Settlements paid (from_user gives money)
-    const settlementsPaidQuery = `
-      SELECT from_user AS user_id, SUM(amount) AS total_settled_paid
-      FROM settlements
-      WHERE group_id = $1
-      GROUP BY from_user;
-    `;
-    const settlementsPaidResult = await pool.query(settlementsPaidQuery, [groupId]);
+    // Settlements: from_user gave money, to_user received money
+    const settledPaidResult = await pool.query(
+      `SELECT from_user AS user_id, SUM(amount) AS total
+       FROM settlements
+       WHERE group_id = $1
+       GROUP BY from_user;`,
+      [groupId]
+    );
 
-    // 6. Settlements received (to_user receives money)
-    const settlementsReceivedQuery = `
-      SELECT to_user AS user_id, SUM(amount) AS total_settled_received
-      FROM settlements
-      WHERE group_id = $1
-      GROUP BY to_user;
-    `;
-    const settlementsReceivedResult = await pool.query(settlementsReceivedQuery, [groupId]);
+    const settledReceivedResult = await pool.query(
+      `SELECT to_user AS user_id, SUM(amount) AS total
+       FROM settlements
+       WHERE group_id = $1
+       GROUP BY to_user;`,
+      [groupId]
+    );
 
-    // Map results into lookup objects
-    const paidMap: { [key: number]: number } = {};
-    paidResult.rows.forEach(row => { paidMap[row.user_id] = parseFloat(row.total_paid); });
+    // Lookup maps (all values in integer paise)
+    const toMap = (rows: { user_id: number; total: string }[]) => {
+      const map: { [key: number]: number } = {};
+      rows.forEach(row => {
+        map[row.user_id] = Number(row.total);
+      });
+      return map;
+    };
 
-    const owedMap: { [key: number]: number } = {};
-    owedResult.rows.forEach(row => { owedMap[row.user_id] = parseFloat(row.total_owed); });
+    const paidMap = toMap(paidResult.rows);
+    const owedMap = toMap(owedResult.rows);
+    const settledPaidMap = toMap(settledPaidResult.rows);
+    const settledReceivedMap = toMap(settledReceivedResult.rows);
 
-    const settledPaidMap: { [key: number]: number } = {};
-    settlementsPaidResult.rows.forEach(row => { settledPaidMap[row.user_id] = parseFloat(row.total_settled_paid); });
-
-    const settledReceivedMap: { [key: number]: number } = {};
-    settlementsReceivedResult.rows.forEach(row => { settledReceivedMap[row.user_id] = parseFloat(row.total_settled_received); });
-
-    // 7. Compute net balance for each member: (Paid + Settlements Paid) - (Owed + Settlements Received)
+    // Net balance = (Paid + Settlements Paid) - (Share Owed + Settlements Received)
+    // Calculated in paise, converted to rupees only for the response.
     const balances = members.map(member => {
       const totalPaid = paidMap[member.id] || 0;
       const totalOwed = owedMap[member.id] || 0;
       const settledPaid = settledPaidMap[member.id] || 0;
       const settledReceived = settledReceivedMap[member.id] || 0;
 
-      const netBalance = (totalPaid + settledPaid) - (totalOwed + settledReceived);
+      const netPaise = totalPaid + settledPaid - (totalOwed + settledReceived);
 
       return {
         user_id: member.id,
         name: member.name,
-        total_paid: totalPaid,
-        total_owed: totalOwed,
-        settled_paid: settledPaid,
-        settled_received: settledReceived,
-        net_balance: Number(netBalance.toFixed(2)),
+        total_paid: toRupees(totalPaid),
+        total_owed: toRupees(totalOwed),
+        settled_paid: toRupees(settledPaid),
+        settled_received: toRupees(settledReceived),
+        net_balance: toRupees(netPaise),
       };
     });
 

@@ -68,3 +68,15 @@ DATABASE_URL=postgres://user:password@localhost:5432/expense_db
 
 # Start development server
 npm run dev
+```
+### 3. Frontend Setup
+
+```bash
+# Navigate to client directory (in a new terminal panel)
+cd client
+
+# Install dependencies
+npm install
+
+# Start Vite development server
+npm run dev  
